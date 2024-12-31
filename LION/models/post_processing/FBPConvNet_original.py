@@ -226,7 +226,7 @@ class FBPConvNet(LIONmodel.LIONmodel):
     @staticmethod
     def default_parameters():
         FBPConvNet_params = FBPConvNetParams(
-            [2, 64, 64, 64],
+            [1, 64, 64, 64],
             [64, 128, 128],
             [128, 256, 256],
             [256, 512, 512],
@@ -268,14 +268,10 @@ class FBPConvNet(LIONmodel.LIONmodel):
                 'cite_format not understood, only "MLA" and "bib" supported'
             )
 
-    def forward(self, x, t):
-    
+    def forward(self, x):
+        B, C, W, H = x.shape
+
         image = fdk(x, self.op)
-        B, C, W, H = image.shape
-        
-        noise_level=t*torch.ones(B,1,W,H).to(torch.cuda.current_device())
-        image = torch.cat([image, noise_level],dim=1) 
-        
         block_1_res = self.block_1_down(image)
         block_2_res = self.block_2_down(self.down_1(block_1_res))
         block_3_res = self.block_3_down(self.down_2(block_2_res))
@@ -288,4 +284,4 @@ class FBPConvNet(LIONmodel.LIONmodel):
         res = self.block_4_up(torch.cat((block_1_res, self.up_4(res)), dim=1))
         res = self.block_last(res)
 
-        return image[:,0:1] + res
+        return image + res

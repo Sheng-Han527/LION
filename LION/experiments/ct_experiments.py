@@ -342,7 +342,7 @@ class clinicalCTRecon(Experiment):
         # Parameters for the noise in the sinogram.
         # Default, 50% of clinical dose.
         param.noise_params = LIONParameter()
-        param.noise_params.I0 = 10000
+        param.noise_params.I0 = 3000
         param.noise_params.sigma = 5
         param.noise_params.cross_talk = 0.05
 
