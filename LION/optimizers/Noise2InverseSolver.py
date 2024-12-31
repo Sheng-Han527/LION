@@ -7,23 +7,10 @@ from LION.classical_algorithms.fdk import fdk
 from LION.models.LIONmodel import LIONmodel
 import torch
 from torch.optim.optimizer import Optimizer
-from LION.optimizers.LIONsolver import LIONsolver, SolverParams
+from LION.optimizers.LIONsolver import LIONsolver
+from LION.utils.parameter import LIONParameter
 import tomosipo as ts
 import LION.CTtools.ct_utils as ct
-
-
-class Noise2InverseParams(SolverParams):
-    def __init__(
-        self,
-        sino_split_count: int,
-        recon_fn: Callable[[torch.Tensor, ts.Operator.Operator], torch.Tensor],
-        cali_J: list[list[int]],
-    ):
-        super().__init__()
-
-        self.sino_split_count = sino_split_count
-        self.recon_fn = recon_fn
-        self.cali_J = cali_J
 
 
 class Noise2InverseSolver(LIONsolver):
@@ -31,19 +18,22 @@ class Noise2InverseSolver(LIONsolver):
         self,
         model: LIONmodel,
         optimizer: Optimizer,
-        loss_fn: torch.nn.Module,
-        solver_params: Optional[Noise2InverseParams],
-        verbose: bool,
-        geo: Geometry,
-        device: torch.device = torch.device(f"cuda:{torch.cuda.current_device()}"),
+        loss_fn,
+        solver_params: Optional[LIONParameter] = None,
+        geometry: Geometry = None,
+        verbose: bool = True,
+        device: torch.device = None,
     ) -> None:
         print(device)
         super().__init__(
-            model, optimizer, loss_fn, geo, verbose, device, solver_params=solver_params
+            model,
+            optimizer,
+            loss_fn,
+            geometry,
+            verbose,
+            device,
+            solver_params=solver_params,
         )
-        assert (
-            model.model_parameters.model_input_type == ModelInputType.IMAGE
-        ), "As reconstructions are done in a special way in Noise2Inverse, require a model that takes Images as input"
 
         self.sino_split_count = self.solver_params.sino_split_count
         self.recon_fn = self.solver_params.recon_fn
@@ -61,16 +51,16 @@ class Noise2InverseSolver(LIONsolver):
     def _make_sub_operators(self) -> list[ts.Operator.Operator]:
         ops = []
         # maintain a copy of the original angles to restore later
-        angles = self.geo.angles.copy()
+        angles = self.geometry.angles.copy()
         assert (
             len(angles) % self.sino_split_count == 0
         ), f"Cannot construct {self.sino_split_count} sinogram splits from {len(angles)} view angles. Ensure that sino_split_count divides #view angles"
         for k in range(self.sino_split_count):
-            self.geo.angles = angles[k :: self.sino_split_count]
-            sub_op = ct.make_operator(self.geo)
+            self.geometry.angles = angles[k :: self.sino_split_count]
+            sub_op = ct.make_operator(self.geometry)
             ops.append(sub_op)
-        # restore self.geo.angles
-        self.geo.angles = angles
+        # restore self.geometry.angles
+        self.geometry.angles = angles
         return ops
 
     def _calculate_noisy_sub_recons(self, sinos):
@@ -96,17 +86,14 @@ class Noise2InverseSolver(LIONsolver):
         return bad_recons
 
     @staticmethod
-    def default_parameters() -> Noise2InverseParams:
-        sino_split_count = 4
-        recon_fn = fdk
-        cali_J = Noise2InverseSolver.X_one_strategy(sino_split_count)
-        return Noise2InverseParams(
-            sino_split_count,
-            recon_fn,
-            cali_J,
-        )
+    def default_parameters() -> LIONParameter:
+        params = LIONParameter()
+        params.sino_split_count = 4
+        params.recon_fn = fdk
+        params.cali_J = Noise2InverseSolver.X_one_strategy(params.sino_split_count)
+        return params
 
-    def mini_batch_step(self, sinos):
+    def mini_batch_step(self, sinos, targets):
         # sinos batch of sinos
         noisy_sub_recons = self._calculate_noisy_sub_recons(sinos)
         # b, split, c, w, h
@@ -171,7 +158,7 @@ class Noise2InverseSolver(LIONsolver):
         noisy_sub_recons = self._calculate_noisy_sub_recons(sinos)  # b, split, c, w, h
 
         outputs = torch.zeros(
-            (sinos.shape[0], *self.geo.image_shape), device=self.device
+            (sinos.shape[0], *self.geometry.image_shape), device=self.device
         )
 
         for _, J in enumerate(self.cali_J):
@@ -189,3 +176,32 @@ class Noise2InverseSolver(LIONsolver):
             outputs += self.model(mean_input_recons)
         outputs /= len(self.cali_J)
         return outputs
+
+    @staticmethod
+    def cite(cite_format="MLA"):
+
+        if cite_format == "MLA":
+            print(
+                "Hendriksen, Allard Adriaan, Daniël Maria Pelt, and K. Joost Batenburg"
+            )
+            print(
+                ' "Noise2inverse: Self-supervised deep convolutional denoising for tomography."'
+            )
+            print("\x1B[3m  IEEE Transactions on Computational Imaging \x1B[0m")
+            print("6 (2020): 1320-1335.")
+        elif cite_format == "bib":
+            string = """
+            @article{hendriksen2020noise2inverse,
+            title={Noise2inverse: Self-supervised deep convolutional denoising for tomography},
+            author={Hendriksen, Allard Adriaan and Pelt, Dani{\"e}l Maria and Batenburg, K Joost},
+            journal={IEEE Transactions on Computational Imaging},
+            volume={6},
+            pages={1320--1335},
+            year={2020},
+            publisher={IEEE}
+            }"""
+            print(string)
+        else:
+            raise AttributeError(
+                'cite_format not understood, only "MLA" and "bib" supported'
+            )

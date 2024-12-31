@@ -72,12 +72,13 @@ class LIONsolver(ABC, metaclass=ABCMeta):
         model: LIONmodel,
         optimizer: Optimizer,
         loss_fn: Callable,
-        geometry: Geometry,
+        geometry: Geometry = None,
         verbose: bool = True,
-        device: torch.device = torch.device(f"cuda:{torch.cuda.current_device()}"),
+        device: torch.device = None,
         solver_params: Optional[SolverParams] = None,
+        save_folder: Optional[pathlib.Path] = None,
     ) -> None:
-        print(device)
+
         super().__init__()
         if solver_params is None:
             self.solver_params = self.default_parameters()
@@ -88,15 +89,23 @@ class LIONsolver(ABC, metaclass=ABCMeta):
 
         self.model = model
         self.optimizer = optimizer
-        self.geo = geometry
-        self.op = make_operator(self.geo)
+
+        if hasattr(model, "geometry") and model.geometry is not None:
+            self.geometry = model.geometry
+        else:
+            assert geometry is not None, "Geometry must be provided"
+            self.geometry = geometry
+
+        self.op = make_operator(self.geometry)
 
         self.train_loader: Optional[DataLoader] = None
         self.train_loss: np.ndarray = np.zeros(0)
 
         self.loss_fn = loss_fn
-
+        if device is None:
+            device = torch.device(torch.cuda.current_device())
         self.device = device
+        self.model.to(self.device)
 
         self.validation_loader: Optional[DataLoader] = None
         self.validation_fn: Optional[Callable] = None
@@ -108,7 +117,7 @@ class LIONsolver(ABC, metaclass=ABCMeta):
 
         self.current_epoch: int = 0
 
-        self.save_folder: Optional[pathlib.Path] = None
+        self.save_folder: Optional[pathlib.Path] = save_folder
 
         self.do_load_checkpoint: bool = False
         self.checkpoint_freq: int
@@ -116,9 +125,7 @@ class LIONsolver(ABC, metaclass=ABCMeta):
         self.final_result_fname: Optional[str] = None
         self.checkpoint_fname: Optional[str] = None
         self.validation_fname: Optional[str] = None
-        self.load_folder: Optional[pathlib.Path] = None
         self.checkpoint_save_folder: Optional[pathlib.Path] = None
-
         self.verbose = verbose
         self.metadata = LIONParameter()
         self.dataset_param = LIONParameter()
@@ -150,16 +157,23 @@ class LIONsolver(ABC, metaclass=ABCMeta):
         validation_freq: int,
         validation_fn: Optional[Callable] = None,
         validation_fname: Optional[str] = None,
+        save_folder: Optional[pathlib.Path] = None,
     ):
         """
         This function sets the validation data
         """
+        if isinstance(save_folder, str):
+            save_folder = pathlib.Path(save_folder)
+        elif save_folder is None:
+            save_folder = self.save_folder
+
         self.validation_loader = validation_loader
         self.validation_freq = validation_freq
         self.validation_fn = (
             validation_fn if validation_fn is not None else self.loss_fn
         )
         self.validation_fname = validation_fname
+        self.validation_save_folder = save_folder
 
     def set_testing(
         self, test_loader: DataLoader, testing_fn: Optional[Callable] = None
@@ -193,32 +207,26 @@ class LIONsolver(ABC, metaclass=ABCMeta):
     def set_checkpointing(
         self,
         checkpoint_fname: str,
-        save_folder: str | pathlib.Path,
-        load_folder: str | pathlib.Path,
         checkpoint_freq: int = 10,
-        do_load: bool = False,
+        load_checkpoint_if_exists: bool = True,
+        save_folder: str | pathlib.Path = None,
     ):
         """
         This function sets the checkpointing
         """
         if isinstance(save_folder, str):
             save_folder = pathlib.Path(save_folder)
-        if isinstance(load_folder, str):
-            load_folder = pathlib.Path(load_folder)
+        elif save_folder is None:
+            save_folder = self.save_folder
 
         if not save_folder.is_dir():
             raise ValueError(
                 f"Save folder '{save_folder}' is not a directory, failed to set checkpointing."
             )
-        if not load_folder.is_dir():
-            raise ValueError(
-                f"Load folder '{load_folder}' is not a directory, failed to set load checkpointing."
-            )
 
         self.checkpoint_freq = checkpoint_freq
         self.checkpoint_fname = checkpoint_fname
-        self.do_load_checkpoint = do_load
-        self.load_folder = load_folder
+        self.do_load_checkpoint = load_checkpoint_if_exists
         self.checkpoint_save_folder = save_folder
 
     def set_normalization(self, do_normalize: bool):
@@ -329,7 +337,7 @@ class LIONsolver(ABC, metaclass=ABCMeta):
             "validation_fn",
             expected_type=callable,
             error=False,
-            autofill=True,
+            autofill=self.validation_loader is not None,
             verbose=verbose,
             default=self.loss_fn,
         )
@@ -338,13 +346,25 @@ class LIONsolver(ABC, metaclass=ABCMeta):
             "validation_freq",
             expected_type=int,
             error=False,
-            autofill=autofill,
+            autofill=self.validation_loader is not None,
             verbose=verbose,
             default=10,
         )
 
+        return_code = self.__check_attribute(
+            "validation_save_folder",
+            expected_type=pathlib.Path,
+            error=False,
+            autofill=True,
+            verbose=True,
+            default=self.save_folder,
+        )
+
         # Test 14: is the validation filename set? if not, raise error or warn or autofill
-        if self.final_result_fname is not None and self.save_folder is not None:
+        if (
+            self.final_result_fname is not None
+            and self.validation_save_folder is not None
+        ):
             default_validation_fname = f"{self.final_result_fname}_min_val.pt"
         else:
             default_validation_fname = None
@@ -384,8 +404,20 @@ class LIONsolver(ABC, metaclass=ABCMeta):
     def check_checkpointing_ready(self, autofill=True, verbose=True):
         return_code = 0
 
+        return_code = self.__check_attribute(
+            "checkpoint_save_folder",
+            expected_type=pathlib.Path,
+            error=False,
+            autofill=True,
+            verbose=True,
+            default=self.save_folder,
+        )
+
         # Test 13: is the checkpoint filename filename set? if not, raise error or warn or autofill
-        if self.final_result_fname is not None and self.save_folder is not None:
+        if (
+            self.final_result_fname is not None
+            and self.checkpoint_save_folder is not None
+        ):
             default_checkpoint_fname = f"{self.final_result_fname}_checkpoint_*.pt"
         else:
             default_checkpoint_fname = None
@@ -534,21 +566,27 @@ class LIONsolver(ABC, metaclass=ABCMeta):
         if self.validation_loss is None:
             raise LIONSolverException("No validation losses found, failed to save.")
 
-        if self.save_folder is None:
-            raise LIONSolverException("Saving not setup: Please call set_saving.")
+        if self.validation_save_folder is None:
+            raise LIONSolverException(
+                "SaviValidation save folder not setup: Please call set_saving() or pass validation foder to set_validation()."
+            )
 
         self.model.save(
-            self.save_folder.joinpath(self.validation_fname),
+            self.validation_save_folder.joinpath(self.validation_fname),
             epoch=epoch,
             training=self.metadata,
             loss=self.validation_loss[epoch],
             dataset=self.dataset_param,
         )
 
-    def save_final_results(self, epoch=None):
+    def save_final_results(self, final_result_fname=None, save_folder=None, epoch=None):
         """
         This function saves the final results of the optimization
         """
+        if save_folder is not None:
+            self.save_folder = save_folder
+        if final_result_fname is not None:
+            self.final_result_fname = final_result_fname
         if self.save_folder is None or self.final_result_fname is None:
             raise LIONSolverException("Saving not setup: Please call set_saving.")
         if epoch is None:
@@ -566,7 +604,7 @@ class LIONsolver(ABC, metaclass=ABCMeta):
         """
         This function cleans the checkpoints
         """
-        if self.save_folder is None:
+        if self.checkpoint_save_folder is None:
             raise LIONSolverException(
                 "Saving not setup, unable to find save folder: Please call set_saving"
             )
@@ -574,9 +612,10 @@ class LIONsolver(ABC, metaclass=ABCMeta):
             raise LIONSolverException(
                 "Checkpointing not setup, can't clear checkpoints: Please call set_checkpointing"
             )
-        # TODO: This doesn't delete the .jsons only the .pt, is this intentional behaviour?
-        # Quick and dirty fix with fancy regex
-        for f in self.save_folder.glob(self.checkpoint_fname.replace(".pt", "")):
+        # this ensures all files with the same extension are removed
+        for f in self.checkpoint_save_folder.glob(
+            self.checkpoint_fname.replace(".pt", "")
+        ):
             f.unlink()
 
     def normalize(self, x):
@@ -619,7 +658,7 @@ class LIONsolver(ABC, metaclass=ABCMeta):
         """
         This function loads a checkpoint (if exists)
         """
-        if self.load_folder is None:
+        if self.checkpoint_save_folder is None:
             raise LIONSolverException("Loading not set. Please call set_loading ")
         if self.checkpoint_fname is None:
             raise LIONSolverException(
@@ -628,29 +667,31 @@ class LIONsolver(ABC, metaclass=ABCMeta):
         (
             self.model,
             self.optimizer,
-            epoch,
+            self.current_epoch,
             self.train_loss,
             _,
         ) = self.model.load_checkpoint_if_exists(
-            self.load_folder.joinpath(self.checkpoint_fname),
+            self.checkpoint_save_folder.joinpath(self.checkpoint_fname),
             self.model,
             self.optimizer,
             self.train_loss,
         )
         if (
             self.validation_fn is not None
-            and epoch > 0
+            and self.current_epoch > 0
             and self.validation_fname is not None
             and self.validation_loss is not None
         ):
-            self.validation_loss[epoch - 1] = self.model._read_min_validation(
-                self.load_folder.joinpath(self.validation_fname)
+            self.validation_loss[
+                self.current_epoch - 1
+            ] = self.model._read_min_validation(
+                self.checkpoint_save_folder.joinpath(self.validation_fname)
             )
             if self.verbose:
                 print(
-                    f"Loaded checkpoint at epoch {epoch}. Current min validation loss is {self.validation_loss[epoch-1]}"
+                    f"Loaded checkpoint at epoch {self.current_epoch}. Current min validation loss is {self.validation_loss[self.current_epoch-1]}"
                 )
-        return epoch
+        return self.current_epoch
 
     def train_step(self):
         """
@@ -679,7 +720,7 @@ class LIONsolver(ABC, metaclass=ABCMeta):
         """
         self.train_loss[epoch] = self.train_step()
         # actually make sure we're doing validation
-        if (epoch + 1) % self.validation_freq == 0 and self.validation_loss is not None:
+        if self.validation_loss is not None and (epoch + 1) % self.validation_freq == 0:
             self.validation_loss[epoch] = self.validate()
             if self.verbose:
                 print(
@@ -692,8 +733,6 @@ class LIONsolver(ABC, metaclass=ABCMeta):
                 self.save_validation(epoch)
         elif self.verbose:
             print(f"Epoch {epoch+1} - Training loss: {self.train_loss[epoch]}")
-        elif self.validation_freq is not None and self.validation_loss is not None:
-            self.validation_loss[epoch] = self.validate()
 
     def train(self, n_epochs):
         """
@@ -712,6 +751,8 @@ class LIONsolver(ABC, metaclass=ABCMeta):
 
         if self.check_validation_ready() == 0:
             self.validation_loss = np.zeros((n_epochs))
+        if self.validation_loader is None:
+            self.validation_loss = None
 
         self.model.train()
         # train loop
@@ -725,12 +766,46 @@ class LIONsolver(ABC, metaclass=ABCMeta):
 
             self.current_epoch += 1
 
-    @abstractmethod
     def validate(self):
         """
-        This function should perform a validation step
+        This function is responsible for performing a single validation set of the optimization.
+        returns the average loss of the validation set this epoch.
         """
-        pass
+        if self.check_validation_ready() != 0:
+            raise LIONSolverException(
+                "Solver not ready for validation. Please call set_validation."
+            )
+
+        # these always pass if the above does, this is just to placate static type checker
+        assert self.validation_loader is not None
+        assert self.validation_fn is not None
+
+        status = self.model.training
+        self.model.eval()
+
+        with torch.no_grad():
+            validation_loss = np.array([])
+            for data, targets in tqdm(self.validation_loader):
+                if self.model.get_input_type() == ModelInputType.IMAGE:
+                    data = fdk(data.to(self.device), self.op)
+                outputs = self.model(data)
+                validation_loss = np.append(
+                    validation_loss,
+                    self.validation_fn(targets.to(self.device), outputs.to(self.device))
+                    .cpu()
+                    .numpy(),
+                )
+
+        if self.verbose:
+            print(
+                f"Testing loss: {validation_loss.mean()} - Testing loss std: {validation_loss.std()}"
+            )
+
+        # return to train if it was in train
+        if status:
+            self.model.train()
+
+        return np.mean(validation_loss)
 
     @abstractmethod
     def mini_batch_step(self, sino_batch, target_batch) -> torch.Tensor:
